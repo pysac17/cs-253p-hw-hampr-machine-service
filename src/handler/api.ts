@@ -21,7 +21,14 @@ export class ApiHandler {
      * @throws An error if the token is invalid.
      */
     private checkToken(token: string) {
-        // Your implementation here
+        const idp = IdentityProviderClient.getInstance();
+        const valid = idp.validateToken(token);
+        if (!valid) {
+            throw new Error(JSON.stringify({
+                statusCode: HttpResponseCode.UNAUTHORIZED,
+                message: 'Invalid token',
+            }));
+        }
     }
 
     /**
@@ -34,8 +41,26 @@ export class ApiHandler {
      * @returns A response model with the status code and the reserved machine's state.
      */
     private handleRequestMachine(request: RequestMachineRequestModel): MachineResponseModel {
-        // Your implementation here
+        const db = MachineStateTable.getInstance();
+
+        const machines = db.listMachinesAtLocation(request.locationId);
+        const available = machines.find(m => m.status === MachineStatus.AVAILABLE);
+        if (!available) {
+            return { statusCode: HttpResponseCode.NOT_FOUND };
+        }
+
+        db.updateMachineStatus(available.machineId, MachineStatus.AWAITING_DROPOFF);
+        db.updateMachineJobId(available.machineId, request.jobId);
+
+        const updated = db.getMachine(available.machineId);
+        if (updated) {
+            this.cache.put(updated.machineId, updated);
+            return { statusCode: HttpResponseCode.OK, machine: updated };
+        }
+
+        return { statusCode: HttpResponseCode.INTERNAL_SERVER_ERROR };
     }
+
 
     /**
      * Retrieves the state of a specific machine.
@@ -44,7 +69,19 @@ export class ApiHandler {
      * @returns A response model with the status code and the machine's state.
      */
     private handleGetMachine(request: GetMachineRequestModel): MachineResponseModel {
-        // Your implementation here
+        const cached = this.cache.get(request.machineId);
+        if (cached) {
+            return { statusCode: HttpResponseCode.OK, machine: cached };
+        }
+
+        const db = MachineStateTable.getInstance();
+        const machine = db.getMachine(request.machineId);
+        if (!machine) {
+            return { statusCode: HttpResponseCode.NOT_FOUND };
+        }
+
+        this.cache.put(request.machineId, machine);
+        return { statusCode: HttpResponseCode.OK, machine };
     }
 
     /**
@@ -55,7 +92,36 @@ export class ApiHandler {
      * @returns A response model with the status code and the updated machine's state.
      */
     private handleStartMachine(request: StartMachineRequestModel): MachineResponseModel {
-        // Your implementation here
+        const db = MachineStateTable.getInstance();
+        const sm = SmartMachineClient.getInstance();
+
+        const machine = db.getMachine(request.machineId);
+        if (!machine) {
+            return { statusCode: HttpResponseCode.NOT_FOUND };
+        }
+
+        if (machine.status !== MachineStatus.AWAITING_DROPOFF) {
+            return { statusCode: HttpResponseCode.BAD_REQUEST, machine };
+        }
+
+        try {
+            sm.startCycle(request.machineId);
+            db.updateMachineStatus(request.machineId, MachineStatus.RUNNING);
+            const updated = db.getMachine(request.machineId);
+            if (updated) {
+                this.cache.put(request.machineId, updated);
+                return { statusCode: HttpResponseCode.OK, machine: updated };
+            }
+            return { statusCode: HttpResponseCode.INTERNAL_SERVER_ERROR };
+        } catch {
+            db.updateMachineStatus(request.machineId, MachineStatus.ERROR);
+            const errored = db.getMachine(request.machineId);
+            if (errored) {
+                this.cache.put(request.machineId, errored);
+                return { statusCode: HttpResponseCode.HARDWARE_ERROR, machine: errored };
+            }
+            return { statusCode: HttpResponseCode.INTERNAL_SERVER_ERROR };
+        }
     }
 
     /**
